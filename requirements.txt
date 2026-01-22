@@ -1,0 +1,25 @@
+# miRNA-mRNA Interaction Prediction
+# Install with: pip install -r requirements.txt
+
+# Deep Learning Framework
+torch>=1.10.0
+transformers>=4.20.0
+
+# Data Processing
+pandas>=1.3.0
+numpy>=1.21.0
+
+# Visualization
+matplotlib>=3.5.0
+
+# Machine Learning Metrics
+scikit-learn>=1.0.0
+
+# Training Utilities
+tqdm>=4.62.0
+wandb>=0.12.0
+
+# Jupyter (optional, for analysis notebooks)
+jupyter>=1.0.0
+ipykernel>=6.0.0
+
