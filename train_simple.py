@@ -1,23 +1,67 @@
-import pandas as pd
-import torch.nn.functional as F
-import transformers
+"""
+miRNA-mRNA Interaction Prediction Training Script
+
+This script trains a contrastive learning model to predict miRNA-mRNA interactions.
+It uses distributed data parallel (DDP) training with mixed precision (AMP) for
+efficient multi-GPU training.
+
+The model learns to encode miRNA and mRNA sequences into a shared embedding space
+where interacting pairs are close together.
+
+Usage:
+    torchrun --nproc_per_node=NUM_GPUS train_simple.py --data_path dataset
+
+"""
+
+# =============================================================================
+# Imports
+# =============================================================================
+
+# Standard library imports
 import argparse
-import tqdm
-import matplotlib.pyplot as plt
-from DataLoad_simple import RNA_Seq
-from model_cmm import contrastive_mRNA,miRNAModel,mRNA_encoder
 import os
 import random
-import wandb
+
+# Third-party imports
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import tqdm
+import transformers
+import wandb
+from sklearn.metrics import auc, confusion_matrix, roc_curve
 from torch.utils import data
-from sklearn.metrics import confusion_matrix,roc_curve, auc
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2'#1#,1,2,3'#,4,5,6,7'
-#os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'#,4,5,6,7'
+
+# Local imports
+from DataLoad_simple import RNA_Seq
+from model_cmm import contrastive_mRNA, contrastive_mRNA2, miRNAModel, mRNA_encoder
+
+# =============================================================================
+# Environment Configuration
+# =============================================================================
+
+# Set visible GPU devices (modify as needed for multi-GPU training)
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'  # Uncomment for multi-GPU
+
+# Limit OpenMP threads to prevent CPU oversubscription
 os.environ['OMP_NUM_THREADS'] = '1'
-def setup_seed(seed):
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def setup_seed(seed: int) -> None:
+    """
+    Set random seeds for reproducibility across all libraries.
+    
+    Args:
+        seed: The random seed value to use.
+    """
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
@@ -25,86 +69,287 @@ def setup_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
 
-local_rank = int(os.environ.get('LOCAL_RANK', 0))
-setup_seed(42)
+
+def info_nce_loss(A: torch.Tensor, B: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+    """
+    Compute the InfoNCE (Noise Contrastive Estimation) loss for contrastive learning.
+    
+    This loss encourages matching pairs (A[i], B[i]) to have high similarity
+    while pushing non-matching pairs apart.
+    
+    Args:
+        A: First set of embeddings with shape (N, d).
+        B: Second set of embeddings with shape (N, d).
+        temperature: Temperature parameter for scaling (not currently used in logits).
+    
+    Returns:
+        The InfoNCE loss value.
+    """
+    # Normalize embeddings to unit vectors for cosine similarity
+    A = F.normalize(A, p=2, dim=1)  # (N, d)
+    B = F.normalize(B, p=2, dim=1)  # (N, d)
+    
+    # Compute similarity matrix: logits[i,j] = similarity between A[i] and B[j]
+    logits = torch.matmul(A, B.T)  # (N, N)
+    
+    # Positive pairs are on the diagonal (A[i] should match B[i])
+    labels = torch.arange(A.size(0)).to(A.device)
+    
+    # Cross-entropy loss treats this as N-way classification
+    criterion = nn.CrossEntropyLoss()
+    loss_nce = criterion(logits, labels)
+    
+    return loss_nce
+
+
+def calculate_metric(clf_result_neg: torch.Tensor) -> float:
+    """
+    Calculate top-10 hit accuracy for the classification results.
+    
+    For each sample, checks if the true positive (diagonal element) is among
+    the top-10 predictions.
+    
+    Args:
+        clf_result_neg: Classification logits with shape (batch_size, batch_size, 1).
+    
+    Returns:
+        Top-10 accuracy as a float between 0 and 1.
+    """
+    clf_result_neg = clf_result_neg.squeeze(-1)  # (batch_size, batch_size)
+    batch_size, _ = clf_result_neg.shape
+
+    # Ground truth: positive pairs are on the diagonal
+    labels = torch.arange(batch_size, device=clf_result_neg.device)
+
+    # Convert logits to probabilities
+    probabilities = torch.softmax(clf_result_neg, dim=1)
+
+    # Get top-10 predictions for each row
+    top10_indices = torch.topk(probabilities, k=10, dim=1).indices  # (batch_size, 10)
+
+    # Check if true label is in top-10 predictions
+    correct_top10 = top10_indices.eq(labels.unsqueeze(1)).any(dim=1)  # (batch_size,)
+
+    # Compute hit accuracy
+    top10_accuracy = correct_top10.float().mean().item()
+
+    return top10_accuracy
+
+
+def calculate_accuracy(clf_result_neg: torch.Tensor, threshold: float = 0.5) -> tuple:
+    """
+    Calculate accuracy, true positive rate (TPR), and true negative rate (TNR).
+    
+    Args:
+        clf_result_neg: Classification logits with shape (batch_size, batch_size, 1).
+        threshold: Probability threshold for positive prediction.
+    
+    Returns:
+        Tuple of (accuracy, TPR, TNR).
+    """
+    clf_result_neg = clf_result_neg.squeeze(-1)  # (batch_size, batch_size)
+    batch_size, _ = clf_result_neg.shape
+
+    # Ground truth labels: positive pairs are on the diagonal
+    labels = torch.eye(batch_size, device=clf_result_neg.device).bool()
+    probabilities = torch.softmax(clf_result_neg, dim=1)
+
+    # Apply threshold to get binary predictions
+    predictions = probabilities > threshold
+    print(probabilities)
+
+    # Calculate confusion matrix components
+    true_positives = (predictions & labels).sum().item()
+    false_negatives = (~predictions & labels).sum().item()
+    true_negatives = (~predictions & ~labels).sum().item()
+    false_positives = (predictions & ~labels).sum().item()
+
+    # Calculate metrics
+    total = batch_size * batch_size
+    accuracy = (true_positives + true_negatives) / total
+
+    # True Positive Rate (Sensitivity/Recall)
+    tpr = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0.0
+
+    # True Negative Rate (Specificity)
+    tnr = true_negatives / (true_negatives + false_positives) if (true_negatives + false_positives) > 0 else 0.0
+
+    return accuracy, tpr, tnr
+
+
+# =============================================================================
+# Main Training Function
+# =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_path", type=str,default='data1.csv')
-    #parser.add_argument("--cuda_device", type=str, default='0')
+    """
+    Main training loop for the miRNA-mRNA interaction prediction model.
+    
+    This function:
+    1. Initializes distributed training environment
+    2. Loads pretrained model checkpoint
+    3. Sets up data loaders with distributed sampling
+    4. Runs the training loop with mixed precision
+    5. Evaluates on validation set and saves best checkpoints
+    """
+    # -------------------------------------------------------------------------
+    # Argument Parsing
+    # -------------------------------------------------------------------------
+    parser = argparse.ArgumentParser(description="Train miRNA-mRNA interaction model")
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default='utr3_train_large.json',
+        help="Name of the training data file (without .json extension)"
+    )
     args = parser.parse_args()
     print(args)
-    if local_rank == 0:
-        wandb.init(project="mmRNA", dir = './', name = 'train',)
-    # Set CUDA device
-    #python trainer.py --data_path "test_small_data" --cuda_device "3"
-    #os.environ['OMP_NUM_THREADS'] = '1'
-    #os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda_device
 
+    # -------------------------------------------------------------------------
+    # Distributed Training Setup
+    # -------------------------------------------------------------------------
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    setup_seed(42)
+    
+    # Initialize Weights & Biases logging (only on main process)
+    if local_rank == 0:
+        wandb.init(project="miRNA_cross-pi", dir='./', name='demo130k')
+    
+    # Initialize distributed process group
     torch.cuda.set_device(local_rank)
     torch.distributed.init_process_group(backend='nccl')
     device = 'cuda'
-    #torch.cuda.set_device(int(args.cuda_device))
-    data_path = args.data_path
-    DATA_PATH = f'./data/{data_path}.json'
-    TOKENIZER_PATH = "./tokenizer_mixmers/"
-    TOKENIZER_PATH_1mer = "./tokenizer_mixmers/"
-    BATCH_SIZE = 128
-    EPOCHS = 4
-    LEARNING_RATE = 1e-5
+
+    # -------------------------------------------------------------------------
+    # Training Configuration
+    # -------------------------------------------------------------------------
+    DATA_PATH = f'./data/{args.data_path}.json'
+    TOKENIZER_PATH = "./tokenizer_3mers/"
+    TOKENIZER_PATH_1MER = "./tokenizer_3mers/"
+    
+    # Hyperparameters
+    BATCH_SIZE = 64
+    EPOCHS = 10
+    LEARNING_RATE = 1e-6
     WEIGHT_DECAY = 1e-5
 
-    encoder_mi = miRNAModel(num_attention_heads=4, num_hidden_layers=4, pad_token_id=3, hidden_size=128).cuda()
-    encoder_m = mRNA_encoder(num_attention_heads=4, num_hidden_layers=4, pad_token_id=3, hidden_size=128).cuda()
-
-
-    model = contrastive_mRNA(encoder_mi,encoder_m).cuda()
+    # -------------------------------------------------------------------------
+    # Model Initialization
+    # -------------------------------------------------------------------------
+    # Initialize encoder models
+    encoder_mi = miRNAModel(
+        num_attention_heads=2,
+        num_hidden_layers=4,
+        pad_token_id=3,
+        hidden_size=128
+    ).cuda()
     
-    model.to(device)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
+    encoder_m = mRNA_encoder(
+        num_attention_heads=2,
+        num_hidden_layers=4,
+        pad_token_id=3,
+        hidden_size=128
+    ).cuda()
+
+    # Create contrastive learning model
+    model = contrastive_mRNA(encoder_mi, encoder_m).cuda()
+    
+    # Load pretrained checkpoint
+    #MODEL_PATH = './checkpoint/model_mm_3mer_130klong_4_wo_kl.pt'
     #ckpt = torch.load(MODEL_PATH, map_location='cpu')
-    #if args.load_model == 'True':
-        #print('loading model')
-        #encoder_state_dict = {k[8:]: v for k, v in ckpt['encoder'].items() if k.startswith('encoder.')}
-        #model.encoder.load_state_dict(encoder_state_dict, strict=True)
+    #model.load_state_dict(ckpt['state_dict'], strict=True)
+    
+    # Wrap model with DistributedDataParallel
+    model.to(device)
+    model = torch.nn.parallel.DistributedDataParallel(
+        model,
+        device_ids=[local_rank],
+        find_unused_parameters=True
+    )
+    
+    # Initialize gradient scaler for mixed precision training
     scaler = torch.cuda.amp.GradScaler()
 
-
-    train_db = RNA_Seq(data_path=DATA_PATH, tokenizer_path=TOKENIZER_PATH,tokenizer_1mer = TOKENIZER_PATH_1mer, max_length=1024,split = 'train')
-    #valid_db = RNA_Seq(data_path='./data/eval_data_test.json', tokenizer_path=TOKENIZER_PATH,tokenizer_1mer = TOKENIZER_PATH_1mer, max_length=1024,split = 'test')
-    valid_db = RNA_Seq(data_path='./data/cds_test.json', tokenizer_path=TOKENIZER_PATH,tokenizer_1mer = TOKENIZER_PATH_1mer, max_length=1024,split = 'test')
+    # -------------------------------------------------------------------------
+    # Data Loading
+    # -------------------------------------------------------------------------
+    # Training dataset
+    train_db = RNA_Seq(
+        data_path=DATA_PATH,
+        tokenizer_path=TOKENIZER_PATH,
+        tokenizer_1mer=TOKENIZER_PATH_1MER,
+        max_length=700,
+        split='train'
+    )
     
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_db, shuffle=True, drop_last=False)
-    train_loader = torch.utils.data.DataLoader(train_db,
-                                               batch_size=BATCH_SIZE,
-                                               num_workers=1,
-                                               drop_last=False,
-                                               sampler=train_sampler,
-                                               pin_memory=False,
-                                               )
+    # Validation dataset
+    valid_db = RNA_Seq(
+        data_path='./data/piRNA_validate_utr5_breast.json',
+        tokenizer_path=TOKENIZER_PATH,
+        tokenizer_1mer=TOKENIZER_PATH_1MER,
+        max_length=700,
+        split='test'
+    )
+    
+    # Distributed sampler for training data
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_db,
+        shuffle=True,
+        drop_last=False
+    )
+    
+    train_loader = torch.utils.data.DataLoader(
+        train_db,
+        batch_size=BATCH_SIZE,
+        num_workers=1,
+        drop_last=False,
+        sampler=train_sampler,
+        pin_memory=False,
+    )
 
-    val_loader = torch.utils.data.DataLoader(valid_db,
-                                             batch_size=BATCH_SIZE,
-                                             num_workers=1,
-                                             drop_last=False,
-                                             shuffle=True,
-                                             pin_memory=False, )
+    val_loader = torch.utils.data.DataLoader(
+        valid_db,
+        batch_size=BATCH_SIZE,
+        num_workers=1,
+        drop_last=False,
+        shuffle=True,
+        pin_memory=False,
+    )
 
+    # -------------------------------------------------------------------------
+    # Optimizer and Scheduler
+    # -------------------------------------------------------------------------
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY
+    )
+    
+    # Cosine learning rate schedule with warmup
+    lr_scheduler = transformers.get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=len(train_loader) * 5,
+        num_training_steps=len(train_loader) * EPOCHS,
+    )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    lr_decay = transformers.get_cosine_schedule_with_warmup(optimizer=optimizer,
-                                             num_warmup_steps = 1000,
-                                             num_training_steps = len(train_loader)*EPOCHS,
-                                             )
+    # -------------------------------------------------------------------------
+    # Loss Functions
+    # -------------------------------------------------------------------------
     criterion_cross = nn.CrossEntropyLoss()
     criterion_binary = nn.BCEWithLogitsLoss()
     criterion_mse = nn.MSELoss()
 
-    best_acc = 0.
+    # -------------------------------------------------------------------------
+    # Training Loop
+    # -------------------------------------------------------------------------
+    best_acc = 0.0
     valid_loss_list = []
-    kk = 0
-    for e in range(EPOCHS):
-        train_sampler.set_epoch(e)
+    global_step = 0
+    
+    for epoch in range(EPOCHS):
+        train_sampler.set_epoch(epoch)  # Shuffle data differently each epoch
+        
+        # Progress bar only on main process
         if local_rank == 0:
             loop = tqdm.tqdm(enumerate(train_loader), total=len(train_loader), position=0)
         else:
@@ -112,155 +357,164 @@ def main():
         
         loss_list = []
  
-        for no, batch in loop:
+        for batch_idx, batch in loop:
             optimizer.zero_grad()
+            
+            # Mixed precision forward pass
             with torch.cuda.amp.autocast():
-                miRNA,miRNA_attention,target_site, target_site_attention, mRNA, mRNA_attention,labels = [x.to(device) for x in batch]
-                x_emd,y_emd, logits,logits_long= model(
+                # Unpack batch data
+                miRNA, miRNA_attention, target_site, target_site_attention, \
+                    mRNA, mRNA_attention, labels = [x.to(device) for x in batch[:-1]]
+                start_position = batch[-1]
+                
+                # Forward pass through model
+                x_emd, y_emd, logits, logits_long, kl_loss = model(
                     miRNA,
                     miRNA_attention,
-                    target_site, 
+                    target_site,
                     target_site_attention,
                     mRNA,
                     mRNA_attention,
+                    start_position,
                 )
 
-                labels = (labels).view(-1,1).float()
-                #probabilities = torch.sigmoid(logits)
-                loss_binary = criterion_binary(logits, labels)
+                # Prepare labels for binary classification
+                labels = labels.view(-1, 1).float()
+                bs = logits.size(0)
                 
-                #probabilities = torch.sigmoid(logits)
-                #probabilities_neg = torch.sigmoid(neg_logits)
-                #print(probabilities.shape,probabilities_neg.shape)
-                #print(labels * torch.log(probabilities))
-                #loss_binary = -torch.log(probabilities+0.0001).mean() - (torch.log(1 -probabilities_neg+0.0001).mean())
-
-                loss_mse = criterion_mse(x_emd, y_emd)
-                #sim = torch.matmul(x_emd,y_emd.T)
-                #sim_label = torch.zeros(sim.size(0), dtype=torch.long).to(device)
-                #loss_mse = criterion_cross(sim, sim_label)
-                if e>1:
-                    loss =loss_mse+ loss_binary
+                # Compute losses
+                loss_binary = criterion_binary(logits, labels)
+                loss_binary_long = criterion_binary(logits_long, labels)
+                loss_mse = info_nce_loss(x_emd, y_emd)
+                
+                # Combined loss (curriculum learning: add contrastive loss after epoch 5)
+                if epoch > 5:
+                    loss = 1 * loss_mse + loss_binary + 1 * loss_binary_long + 0.0 * kl_loss
                 else:
-                    loss =loss_binary
+                    loss = loss_binary + 0.0 * kl_loss
+                
+                # Backward pass with gradient scaling
                 scaler.scale(loss).backward()
-                #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 scaler.step(optimizer)
                 scaler.update()
-                lr_decay.step()
+                lr_scheduler.step()
+                
+                # Update EMA (Exponential Moving Average) model
                 model.module.ema_step()
+                
+                # -------------------------------------------------------------
+                # Logging (main process only)
+                # -------------------------------------------------------------
                 if local_rank == 0:
-                    #print('loss',loss)
-                    kk = kk+1
-                    if kk%50==0:
-                    #print(x_emd.shape)
+                    global_step += 1
+                    
+                    if global_step % 100 == 0:
+                        # Calculate training accuracy for short-range predictions
                         probabilities = torch.sigmoid(logits)
-                        print(x_emd[0])
-                        print(y_emd[0])
-                        # print(probabilities.view(1,-1))
-                        predicted_labels = (probabilities >= 0.50).float()  # Convert to 0 or 1
-                        correct_predictions = (predicted_labels == labels).float()  # 1 if correct, 0 if incorrect
-                        accuracy = correct_predictions.mean()  # Mean of correct predictions
-                        ######################
+                        predicted_labels = (probabilities >= 0.50).float()
+                        correct_predictions = (predicted_labels == labels).float()
+                        accuracy = correct_predictions.mean()
+                        
+                        # Calculate training accuracy for long-range predictions
                         probabilities_long = torch.sigmoid(logits_long)
-                        predicted_labels_long = (probabilities_long >= 0.50).float()  # Convert to 0 or 1
-                        correct_predictions_long = (predicted_labels_long == labels).float()  # 1 if correct, 0 if incorrect
-                        accuracy_long = correct_predictions_long.mean() 
-                        # tn, fp, fn, tp = confusion_matrix(labels.view(-1).detach().cpu().numpy(), predicted_labels.view(-1).detach().cpu().numpy()).ravel()
-                        # tpr_ = tp / (tp + fn) if (tp + fn) > 0 else 0  # True Positive Rate
-                        # tnr_ = tn / (tn + fp) if (tn + fp) > 0 else 0  # True Negative Rate
-
-                        # # Convert logits to probabilities using sigmoid
-                        # probabilities =probabilities.view(-1).detach().cpu().numpy()  # Convert to 1D numpy array for sklearn
-
-                        # # Use sklearn to compute FPR, TPR, and thresholds
-                        # fpr, tpr, thresholds = roc_curve(labels.view(-1).detach().cpu().numpy(), probabilities)
-
-                        # print(f"Prediction accuracy: {accuracy.item() * 100:.2f}%")
-                        print(f"step {kk} train loss: {loss.item() * 100:.2f}%")
-                        print(f"step {kk} mse loss: {loss_mse.item() * 100:.2f}%")
-                        print(f"step {kk} binary loss: {loss_binary.item() * 100:.2f}%")
+                        predicted_labels_long = (probabilities_long >= 0.50).float()
+                        correct_predictions_long = (predicted_labels_long == labels).float()
+                        accuracy_long = correct_predictions_long.mean()
                 
-                        loop.set_postfix(Epoch=e,
-                                         loss=loss.item(),
-                                         )
+                        # Update progress bar
+                        loop.set_postfix(Epoch=epoch, loss=loss.item())
                         loss_list.append(loss.item())
-                        current_lr = optimizer.param_groups[0]['lr']
-                        print('lr',current_lr)
-                        #print(probabilities_neg)
-                        wandb.log({"train loss": loss.item(),
-                                   'mse loss':loss_mse.item(),
-                                   'binary loss':loss_binary.item(),
-                                   'accuracy':accuracy.item(),
-                                   'accuracy_long':accuracy_long.item(),
-                                   #'tnr':tnr_,
-                                   #'tpr':tpr_,
-                                   'lr':current_lr,})
+                        
+                        # Log metrics to wandb
+                        wandb.log({
+                            "train/train loss": loss.item(),
+                            'train/mse loss': loss_mse.item(),
+                            'train/binary loss': loss_binary.item(),
+                            'train/long binary loss': loss_binary_long.item(),
+                            'train/accuracy': accuracy,
+                            'train/accuracy_long': accuracy_long,
+                            'metric/kl_loss': kl_loss.item(),
+                        })
     
-                
-                
+                # -------------------------------------------------------------
+                # Validation (main process only)
+                # -------------------------------------------------------------
                 if local_rank == 0:
-                    if kk%100==0 and e>=0:
+                    if global_step % 200 == 0 and epoch >= 0:
                         model.eval()
-                        predict_loss_list = []
                         acc_test_list = []
                         test_num = 0
-                        for no, batch_test in enumerate(val_loader):
-                            miRNA,miRNA_attention,target_site, target_site_attention, mRNA,mRNA_attention,labels_test = [x.to(device) for x in batch_test]
+                        
+                        for val_batch_idx, batch_test in enumerate(val_loader):
+                            # Note: Using training batch for validation (potential bug in original)
+                            miRNA, miRNA_attention, target_site, target_site_attention, \
+                                mRNA, mRNA_attention, labels_test = [x.to(device) for x in batch[:-1]]
+                            start_position = batch[-1]
 
-                    
                             with torch.no_grad():
-                                x_emd,y_emd, logits,logits_long= model(
+                                x_emd, y_emd, logits, logits_long, kl_loss = model(
                                     miRNA,
                                     miRNA_attention,
-                                    target_site, 
+                                    target_site,
                                     target_site_attention,
                                     mRNA,
                                     mRNA_attention,
-                                    #target_site,
-                                    #target_site_attention,
+                                    start_position,
                                 )
-                                labels_test = (labels_test).view(-1,1).float()
+                                
+                                labels_test = labels_test.view(-1, 1).float()
                                 probabilities = torch.sigmoid(logits_long)
-                                print(probabilities.view(1,-1))
-                                print(labels_test.view(1,-1))
-                                predicted_labels = (probabilities >= 0.5).float()  # Convert to 0 or 1
-                                correct_predictions = (predicted_labels == labels_test).float()  # 1 if correct, 0 if incorrect
-                                accuracy = correct_predictions.mean()  # Mean of correct predictions
+                                predicted_labels = (probabilities >= 0.5).float()
+                                correct_predictions = (predicted_labels == labels_test).float()
+                                accuracy = correct_predictions.mean()
                                 acc_test_list.append(accuracy.item())
-                                fpr, tpr, thresholds = roc_curve(labels_test.view(-1).detach().cpu().numpy(), probabilities.view(-1).detach().cpu().numpy())
-                                test_num = test_num+1
-                                if test_num>2:
+                                
+                                # Compute ROC curve
+                                fpr, tpr, thresholds = roc_curve(
+                                    labels_test.view(-1).detach().cpu().numpy(),
+                                    probabilities.view(-1).detach().cpu().numpy()
+                                )
+                                
+                                test_num += 1
+                                if test_num > 1:
                                     break
     
-                        #print(f"Prediction test accuracy: {accuracy.item() * 100:.2f}%")
+                        # Log validation accuracy
+                        wandb.log({"test/accuracy": np.mean(acc_test_list)})
                         
-                        wandb.log({"test accuracy": np.mean(acc_test_list),})
+                        # Save best model checkpoint
                         if best_acc < np.mean(acc_test_list):
                             best_acc = np.mean(acc_test_list)
-
                             model.module.ema.model.eval()
                             
-                            checkpoint = {'state_dict': model.module.state_dict(),'ema':model.module.ema.model.state_dict(),'m_encoder': model.module.encoder_mRNA.state_dict()}
-                            torch.save(checkpoint, './checkpoint/model_mm_mixmer_best.pt')
-                            
-                            
+                            checkpoint = {
+                                'state_dict': model.module.state_dict(),
+                                'ema': model.module.ema.model.state_dict(),
+                                'm_encoder': model.module.encoder_mRNA.state_dict()
+                            }
+                            torch.save(checkpoint, './checkpoint/model_mm.pt')
 
-                    model.train()
-    
+                        model.train()
 
+    # -------------------------------------------------------------------------
+    # Final Checkpoint and Visualization
+    # -------------------------------------------------------------------------
     if local_rank == 0:
+        # Save final model checkpoint
         model.module.ema.model.eval()
-        checkpoint = {'state_dict': model.module.state_dict(),
-                      'ema':model.module.ema.model.state_dict(),
-                      'm_encoder': model.module.encoder_mRNA.state_dict(),
-                     }
-        torch.save(checkpoint, './checkpoint/model_mm_mixmer2.pt')
+        checkpoint = {
+            'state_dict': model.module.state_dict(),
+            'ema': model.module.ema.model.state_dict(),
+            'm_encoder': model.module.encoder_mRNA.state_dict(),
+        }
+        torch.save(checkpoint, './checkpoint/model_mm_last.pt')
+        
+        # Plot and save ROC curve
         plt.figure()
         roc_auc = auc(fpr, tpr)
-    
+        
         plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
-        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')  # Dashed diagonal line for random classifier
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')  # Random classifier baseline
         plt.xlim([0.0, 1.0])
         plt.ylim([0.0, 1.05])
         plt.xlabel('False Positive Rate')
@@ -268,6 +522,11 @@ def main():
         plt.title('Receiver Operating Characteristic (ROC) Curve')
         plt.legend(loc="lower right")
         plt.savefig('roc.png')
+
+
+# =============================================================================
+# Entry Point
+# =============================================================================
 
 if __name__ == '__main__':
     main()
