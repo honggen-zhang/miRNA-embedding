@@ -48,6 +48,7 @@ pip install torch transformers pandas numpy scikit-learn matplotlib tqdm wandb
 ## Data Format
 
 Training data should be in JSON format with the following structure:
+The dataset can be found here https://drive.google.com/drive/folders/119ssqxNLSo63po_yYWxLs-6GL6OI5gvo?usp=sharing
 
 | Column | Description |
 |--------|-------------|
