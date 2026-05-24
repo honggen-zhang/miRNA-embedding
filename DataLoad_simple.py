@@ -10,7 +10,7 @@ import numpy as np
 import random
 
 def split_into_one_mers(sequence):
-    one_mers = [sequence[i:i+1] for i in range(0, len(sequence), 1)]
+    one_mers = [sequence[i:i+3] for i in range(0, len(sequence), 1)]
     sequence_preprocessed = ' '.join(one_mers)
     return sequence_preprocessed
     
